@@ -38,6 +38,13 @@ class LFWebView extends StatefulWidget {
   final bool allowsBackForwardNavigationGestures;
   final bool useHybridComposition;
   final bool isInspectable;
+
+  /// Opt-in loading overlay recovery (SAZO fork). When false (default) the
+  /// behavior is identical to upstream v2.4.5-dev+2. When true:
+  /// - main-frame web resource errors release the loading overlay,
+  /// - a JS/parse failure while measuring height still releases the overlay,
+  /// - mailto:/tel:/geo: are matched by scheme prefix instead of substring.
+  final bool useLoadingOverlayRecovery;
   final String? userAgent;
   final Duration? loaderDelay;
   final LFWebViewOnBeforeLoaded? onInitBeforeLoaded;
@@ -68,6 +75,7 @@ class LFWebView extends StatefulWidget {
     this.allowsBackForwardNavigationGestures = true,
     this.useHybridComposition = false,
     this.isInspectable = false,
+    this.useLoadingOverlayRecovery = false,
     this.userAgent,
     this.loaderDelay,
     this.onInitBeforeLoaded,
@@ -218,7 +226,21 @@ class _LFWebViewState extends State<LFWebView> {
         onPageFinished?.call();
       },
       onWebResourceError: (WebResourceError error) {
-        Logging.d('[LFWebView] onWebResourceError = ${error.errorCode}');
+        Logging.d(
+            '[LFWebView] onWebResourceError = ${error.errorCode} (mainFrame: ${error.isForMainFrame})');
+        // A failed or interrupted main-frame navigation never reaches
+        // onPageFinished (e.g. iOS hands a redirect off to an external app),
+        // so release the loading overlay here or the screen stays locked.
+        // Sub-frame errors (iframes) are ignored. The next onPageStarted
+        // raises the overlay again.
+        if (widget.useLoadingOverlayRecovery &&
+            (error.isForMainFrame ?? true)) {
+          if (mounted && _loading) {
+            setState(() {
+              _loading = false;
+            });
+          }
+        }
       },
       onNavigationRequest: (NavigationRequest request) async {
         Logging.d('[LFWebView] navigationDelegate = ${request.url}');
@@ -360,15 +382,22 @@ class _LFWebViewState extends State<LFWebView> {
 
   Future<NavigationDecision> navigationURLToLinkEvent(String url) async {
     final onNavigationDecision = widget.onNavigationDecision;
-    if (url.contains('mailto:')) {
+    // With recovery enabled, match the URL scheme, not a substring: an https
+    // URL whose path or query contains e.g. 'hotel:' must not be treated as a
+    // tel: link. Otherwise keep the upstream substring matching.
+    final lowerUrl = url.toLowerCase();
+    bool isLink(String scheme) => widget.useLoadingOverlayRecovery
+        ? lowerUrl.startsWith(scheme)
+        : url.contains(scheme);
+    if (isLink('mailto:')) {
       Logging.d('[LFWebView] navigationDelegate :: Mailto clicked! = $url');
       final _ = onNavigationDecision?.call(LFWebViewEventType.mailto, url);
       return NavigationDecision.prevent;
-    } else if (url.contains('tel:')) {
+    } else if (isLink('tel:')) {
       Logging.d('[LFWebView] navigationDelegate :: Tel clicked! = $url');
       final _ = onNavigationDecision?.call(LFWebViewEventType.tel, url);
       return NavigationDecision.prevent;
-    } else if (url.contains('geo:')) {
+    } else if (isLink('geo:')) {
       Logging.d('[LFWebView] navigationDelegate :: GEO clicked! = $url');
       final _ = onNavigationDecision?.call(LFWebViewEventType.geo, url);
       return NavigationDecision.prevent;
@@ -383,24 +412,32 @@ class _LFWebViewState extends State<LFWebView> {
   Future<void> updateWebViewHeightAfterOnPageFinished() async {
     final controller = widget.controller;
     final webViewController = controller.webViewController;
-    final readyState = await webViewController
-        .runJavaScriptReturningResult('document.readyState');
-    Logging.d('[LFWebView] readyState: $readyState');
-    if (readyState == 'complete' || readyState == '"complete"') {
-      final height = await webViewController
-          .runJavaScriptReturningResult('document.body.scrollHeight');
-      final heightStr = height.toString();
-      final documentHeight = double.parse(heightStr);
-      Logging.d('[LFWebView] DocumentHeight: $documentHeight');
-      final fullScreen = widget.fullScreen;
-      if (!fullScreen) {
-        if (context.mounted) {
-          setState(() {
-            _contentHeight = documentHeight;
-          });
+    // With recovery enabled, a JS evaluation or parse failure here must not
+    // skip releasing the loading overlay below.
+    try {
+      final readyState = await webViewController
+          .runJavaScriptReturningResult('document.readyState');
+      Logging.d('[LFWebView] readyState: $readyState');
+      if (readyState == 'complete' || readyState == '"complete"') {
+        final height = await webViewController
+            .runJavaScriptReturningResult('document.body.scrollHeight');
+        final heightStr = height.toString();
+        final documentHeight = double.parse(heightStr);
+        Logging.d('[LFWebView] DocumentHeight: $documentHeight');
+        final fullScreen = widget.fullScreen;
+        if (!fullScreen) {
+          if (context.mounted) {
+            setState(() {
+              _contentHeight = documentHeight;
+            });
+          }
         }
+        widget.onHeightFinished?.call(documentHeight);
       }
-      widget.onHeightFinished?.call(documentHeight);
+    } catch (e) {
+      // Upstream behavior: the failure propagates and the overlay stays.
+      if (!widget.useLoadingOverlayRecovery) rethrow;
+      Logging.d('[LFWebView] updateWebViewHeight error: $e');
     }
     if (context.mounted) {
       final loaderDelay = widget.loaderDelay;
